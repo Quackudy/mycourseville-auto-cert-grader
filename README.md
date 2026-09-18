@@ -1,8 +1,11 @@
-# MyCourseVille certificate reader
+# MyCourseVille certificate grader
 
-This is a read-only dry-run scanner. It never enters a score, submits a form,
-adds a comment, announces a grade, or changes a lock. After manual login, a
-network guard blocks all `POST`, `PUT`, `PATCH`, and `DELETE` requests.
+This toolkit provides three modes: a read-only scanner, a strict automatic
+certificate grader, and an assisted manual-review workflow. None of the modes
+ever assigns `0`, adds comments, announces grades, or changes locks.
+
+The read-only `scan` mode never enters a score or submits a form. After manual
+login, a network guard blocks all `POST`, `PUT`, `PATCH`, and `DELETE` requests.
 
 The scanner considers a submission a candidate for human approval only when:
 
@@ -38,6 +41,42 @@ student data and should be deleted when no longer needed.
 English OCR uses the project-local `tessdata/eng.traineddata` file, so it does
 not depend on system-installed language packs.
 
+## Recommended workflow
+
+Run the strict automatic grader first:
+
+```bash
+npm run auto-grade
+```
+
+For the safest and most reproducible run, explicitly provide the assignment's
+submissions URL, expected module, and course code. Example:
+
+```bash
+npm run auto-grade -- --url 'https://www.mycourseville.com/?q=courseville/course/81802/submission_2084333' --module 1 --course 2110204 --delay-ms 1000
+```
+
+Always copy the URL from the module you actually intend to grade and update the
+module/course values to match. `--delay-ms` is measured in milliseconds and
+must be between `1000` and `30000`; use `10000` for a ten-second delay. Quote
+the URL so the shell passes it unchanged.
+
+It awards `1/1` only to certificates that pass every strict check and leaves
+all invalid, unusual, or uncertain submissions untouched. Use the visible Stop
+button or Escape if anything looks wrong.
+
+After auto-grade finishes, run assisted mode on the same assignment:
+
+```bash
+npm run assist
+```
+
+Assisted mode skips existing grades and walks through the submissions left for
+manual review. It displays valid images beside the form and shows a clear
+manual-review panel for broken, indirect, or unrecognized links. In short:
+**auto-grade the high-confidence certificates first, then use assist for the
+remaining edge cases.**
+
 ## Assisted manual grading
 
 ```bash
@@ -65,7 +104,9 @@ site's native Submit button.
 After a user-initiated submission, assisted mode advances only if it observes
 the score-bearing POST response and a new visible `Grading updated at`
 confirmation. Broken links, HTML pages, OCR mismatches, existing grades, and
-unexpected form structures are skipped and logged under `assist-reports/`.
+unexpected form structures are never graded. For an unopenable or uncertain
+submission, assisted mode displays a manual-review panel with the reason and
+submitted link; choose **Leave ungraded and continue** or stop the session.
 
 To test the visual panel without pre-filling scores, use:
 
@@ -76,8 +117,8 @@ npm run assist -- --limit 3 --preview-only
 ## Strict automatic certificate mode
 
 `auto-grade` is only for objective certificate assignments worth `1/1`. It
-never assigns `0`, comments, announces, or changes locks. It scans every row
-first and accepts only official generated MyCourseVille JPEG certificates with
+never assigns `0`, comments, announces, or changes locks. It processes rows in
+order and accepts only official generated MyCourseVille JPEG certificates with
 the expected path, file signature, 2400x1600 dimensions, exact English name,
 student ID, course code, module number, and fixed certificate wording. Exact
 duplicate files and every anomaly are left untouched.
@@ -107,18 +148,18 @@ For a live run:
 npm run auto-grade
 ```
 
-After scanning, the tool prints the exact candidate count and requires a
-one-time `SUBMIT N` authorization for that batch. It then submits `1/1` only for
-those candidates and verifies MyCourseVille's visible save confirmation after
-every submission. Any unconfirmed save stops the entire run. Evidence and an
-audit CSV are retained under `auto-grade-reports/`.
+Each strict match is submitted after its visible safety countdown; there is no
+batch authorization prompt. The tool verifies MyCourseVille's visible save
+confirmation after every submission before proceeding. Any unconfirmed save
+stops the entire run. Evidence and an audit CSV are retained under
+`auto-grade-reports/`.
 
 Auto mode displays every passing certificate beside the grading form. Before
-each submission it shows a three-second countdown. Click **STOP IMMEDIATELY** or
+each submission it shows a 1.5-second countdown. Click **STOP IMMEDIATELY** or
 press Escape to halt before the next Submit action. The delay can be increased,
 for example with `--delay-ms 5000`.
 
-## Safety properties
+## Read-only scanner safety properties
 
 - No code exists for locating or filling score/comment controls.
 - No code clicks grade, submit, announce, or lock controls.

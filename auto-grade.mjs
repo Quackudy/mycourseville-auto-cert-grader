@@ -1,6 +1,6 @@
 import { chromium } from "playwright";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -34,7 +34,7 @@ function parseArgs(argv) {
     moduleNumber: "",
     offset: 0,
     limit: Infinity,
-    delayMs: 3000,
+    delayMs: 500,
     dryRun: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -60,8 +60,8 @@ function parseArgs(argv) {
   if (!options.help && options.courseCode && !/^\d{7}$/.test(options.courseCode)) {
     throw new Error("--course must be exactly seven digits");
   }
-  if (!options.help && (!Number.isInteger(options.delayMs) || options.delayMs < 1000 || options.delayMs > 30_000)) {
-    throw new Error("--delay-ms must be an integer between 1000 and 30000");
+  if (!options.help && (!Number.isInteger(options.delayMs) || options.delayMs < 1 || options.delayMs > 30_000)) {
+    throw new Error("--delay-ms must be an integer between 1 and 30000");
   }
   return options;
 }
@@ -224,19 +224,6 @@ async function promptForPage(page) {
   await page.bringToFront();
 }
 
-async function confirmBatch(count, assignment) {
-  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
-  console.log("\nSTRICT AUTO-GRADE SUMMARY");
-  console.log(`Assignment: ${assignment.assignmentLine || "(title unavailable)"}`);
-  console.log(`Course: ${assignment.courseCode}; module: ${assignment.moduleNumber}`);
-  console.log(`Passing untouched submissions ready for 1/1: ${count}`);
-  console.log("All other submissions will remain unchanged. No 0 scores, comments, or announcements will be made.");
-  const expected = `SUBMIT ${count}`;
-  const answer = await terminal.question(`Type ${expected} to authorize this exact batch: `);
-  terminal.close();
-  return answer.trim() === expected;
-}
-
 async function writeReport(reportPath, rows, assignment) {
   const columns = [
     "student_id",
@@ -365,9 +352,13 @@ async function main() {
     const allRows = await collectRows(page);
     const end = options.limit === Infinity ? undefined : options.offset + options.limit;
     const rows = allRows.slice(options.offset, end);
-    console.log(`Scanning ${rows.length} submitted, apparently ungraded row(s) without changing grades...`);
+    console.log(
+      options.dryRun
+        ? `Dry-scanning ${rows.length} submitted, apparently ungraded row(s) without changing grades...`
+        : `Processing ${rows.length} submitted, apparently ungraded row(s). Strict matches will submit automatically after the visible safety countdown.`,
+    );
 
-    const candidates = [];
+    const seenHashes = new Set();
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const result = {
@@ -402,6 +393,19 @@ async function main() {
         continue;
       }
 
+      // Check the grading form before downloading or OCRing. This makes repeat
+      // runs and queues containing already-graded students much faster.
+      const scoreInput = await findScoreInput(page);
+      const submitButton = await findSubmitButton(page);
+      if (!scoreInput || !submitButton) {
+        await skip("Expected blank /1 score form was not found safely");
+        continue;
+      }
+      if (String(scoreInput.value || "").trim()) {
+        await skip("Score is already populated; refusing to overwrite it");
+        continue;
+      }
+
       const imageFilename = `${row.id.replace(/[^A-Za-z0-9_-]/g, "_")}.jpg`;
       const imagePath = path.join(imageDir, imageFilename);
       const image = await downloadStrictCertificate(context, detail.url, imagePath);
@@ -411,6 +415,11 @@ async function main() {
       }
       result.sha256 = image.sha256;
       result.evidence_image = `images/${imageFilename}`;
+      if (seenHashes.has(image.sha256)) {
+        await skip("Duplicate certificate bytes already encountered earlier in this run");
+        continue;
+      }
+      seenHashes.add(image.sha256);
 
       const studentTemp = await mkdtemp(path.join(tempRoot, "ocr-"));
       let ocrText;
@@ -435,105 +444,37 @@ async function main() {
         continue;
       }
 
-      const scoreInput = await findScoreInput(page);
-      const submitButton = await findSubmitButton(page);
-      if (!scoreInput || !submitButton) {
-        await skip("Expected blank /1 score form was not found safely");
-        continue;
-      }
-      if (String(scoreInput.value || "").trim()) {
-        await skip("Score is already populated; refusing to overwrite it");
-        continue;
-      }
-
       await showCertificateOverlay(page, {
         candidate: { ...result, name: detail.englishName },
         imageBytes: image.bytes,
         assignment,
-        status: "Strict checks passed · read-only scan phase",
+        status: options.dryRun ? "Strict checks passed · dry-run only" : "Strict checks passed · preparing safety countdown",
       });
-      await page.waitForTimeout(350);
+      await page.waitForTimeout(options.dryRun ? 350 : 100);
       if (stopRequested) {
         result.status = "STOPPED";
-        result.reason = "Stopped by user during read-only scan; grade unchanged";
+        result.reason = "Stopped by user before submission; grade unchanged";
         results.push(result);
         await writeReport(reportPath, results, assignment);
-        console.log("Stopped during read-only scan. No grades were changed by this run.");
-        return;
-      }
-
-      result.status = "CANDIDATE";
-      result.reason = "Passed all strict certificate checks; grade not yet changed";
-      results.push(result);
-      candidates.push(result);
-      await writeReport(reportPath, results, assignment);
-      console.log(`[${index + 1}/${rows.length}] strict candidate ${row.id}`);
-    }
-
-    const byHash = new Map();
-    for (const candidate of candidates) {
-      const matches = byHash.get(candidate.sha256) ?? [];
-      matches.push(candidate);
-      byHash.set(candidate.sha256, matches);
-    }
-    for (const matches of byHash.values()) {
-      if (matches.length < 2) continue;
-      for (const candidate of matches) {
-        candidate.status = "SKIPPED";
-        candidate.reason = `Duplicate certificate bytes detected across ${matches.length} submissions`;
-      }
-    }
-    const eligible = candidates.filter((candidate) => candidate.status === "CANDIDATE");
-    await writeReport(reportPath, results, assignment);
-    console.log(`\nScan complete: ${eligible.length} strict candidate(s), ${results.length - eligible.length} untouched skip(s).`);
-    console.log(`Audit report: ${reportPath}`);
-
-    if (options.dryRun || eligible.length === 0) {
-      console.log(options.dryRun ? "Dry run complete. No grades were changed." : "No eligible grades to submit.");
-      return;
-    }
-    if (!(await confirmBatch(eligible.length, assignment))) {
-      console.log("Authorization text did not match. No grades were changed.");
-      return;
-    }
-
-    for (let index = 0; index < eligible.length; index += 1) {
-      const candidate = eligible[index];
-      if (stopRequested) {
-        console.log("Stopped before starting the next submission.");
+        console.log("Stopped before the next submission.");
         break;
       }
-      await page.goto(candidate.grading_url, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      const detail = await extractDetail(page, candidate.name);
-      if (detail.reason || detail.url !== candidate.submitted_url) {
-        candidate.status = "SKIPPED";
-        candidate.reason = "Submission changed after scan; left untouched";
-        await writeReport(reportPath, results, assignment);
-        continue;
-      }
-      const scoreInput = await findScoreInput(page);
-      const submitButton = await findSubmitButton(page);
-      if (!scoreInput || !submitButton || String(scoreInput.value || "").trim()) {
-        candidate.status = "SKIPPED";
-        candidate.reason = "Score form changed, missing, or already populated; left untouched";
+
+      if (options.dryRun) {
+        result.status = "CANDIDATE_DRY_RUN";
+        result.reason = "Passed all strict checks; dry run left grade unchanged";
+        results.push(result);
         await writeReport(reportPath, results, assignment);
         continue;
       }
 
-      const evidencePath = path.join(runDir, candidate.evidence_image);
-      const evidenceBytes = await readFile(evidencePath);
-      await showCertificateOverlay(page, {
-        candidate,
-        imageBytes: evidenceBytes,
-        assignment,
-        status: "Preparing safety countdown",
-      });
       const continueSubmission = await safetyCountdown(page, options.delayMs, () => stopRequested);
       if (!continueSubmission) {
-        candidate.status = "STOPPED_BEFORE_SUBMIT";
-        candidate.reason = "Emergency stop requested before score entry; grade unchanged";
+        result.status = "STOPPED_BEFORE_SUBMIT";
+        result.reason = "Emergency stop requested before score entry; grade unchanged";
+        results.push(result);
         await writeReport(reportPath, results, assignment);
-        console.log(`Stopped safely before submitting ${candidate.student_id}.`);
+        console.log(`Stopped safely before submitting ${result.student_id}.`);
         break;
       }
 
@@ -546,9 +487,7 @@ async function main() {
         return element.value === "1";
       });
       if (!filled) {
-        candidate.status = "SKIPPED";
-        candidate.reason = "Score field refused safe 1 prefill; left untouched";
-        await writeReport(reportPath, results, assignment);
+        await skip("Score field refused safe 1 prefill; left untouched");
         continue;
       }
 
@@ -556,10 +495,11 @@ async function main() {
         await scoreInput.locator.evaluate((element) => {
           element.value = "";
         });
-        candidate.status = "STOPPED_BEFORE_SUBMIT";
-        candidate.reason = "Emergency stop requested after prefill; score cleared and not submitted";
+        result.status = "STOPPED_BEFORE_SUBMIT";
+        result.reason = "Emergency stop requested after prefill; score cleared and not submitted";
+        results.push(result);
         await writeReport(reportPath, results, assignment);
-        console.log(`Stopped safely before clicking Submit for ${candidate.student_id}.`);
+        console.log(`Stopped safely before clicking Submit for ${result.student_id}.`);
         break;
       }
 
@@ -570,19 +510,28 @@ async function main() {
       await submitButton.click();
       const save = await waitForSave(page, saveResponsePromise, previousUpdatedText);
       if (!save.ok) {
-        candidate.status = "SAVE_UNCONFIRMED";
-        candidate.reason = save.reason;
+        result.status = "SAVE_UNCONFIRMED";
+        result.reason = save.reason;
+        results.push(result);
         await writeReport(reportPath, results, assignment);
-        throw new Error(`Stopped after unconfirmed save for ${candidate.student_id}: ${save.reason}`);
+        throw new Error(`Stopped after unconfirmed save for ${result.student_id}: ${save.reason}`);
       }
-      candidate.status = "AUTO_SUBMITTED_1";
-      candidate.reason = save.reason;
+      result.status = "AUTO_SUBMITTED_1";
+      result.reason = save.reason;
+      results.push(result);
       await writeReport(reportPath, results, assignment);
       await updateOverlayStatus(page, "Confirmed saved: 1/1");
-      console.log(`[${index + 1}/${eligible.length}] confirmed 1/1 for ${candidate.student_id}`);
+      console.log(`[${index + 1}/${rows.length}] confirmed 1/1 for ${result.student_id}`);
       await page.waitForTimeout(400);
     }
-    console.log(`\nFinished. Audit report: ${reportPath}`);
+    const submitted = results.filter((row) => row.status === "AUTO_SUBMITTED_1").length;
+    const dryCandidates = results.filter((row) => row.status === "CANDIDATE_DRY_RUN").length;
+    console.log(
+      options.dryRun
+        ? `\nDry run complete: ${dryCandidates} strict candidate(s). No grades were changed.`
+        : `\nFinished: ${submitted} confirmed 1/1 submission(s).`,
+    );
+    console.log(`Audit report: ${reportPath}`);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
     await context.close();

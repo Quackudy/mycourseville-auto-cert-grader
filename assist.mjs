@@ -261,6 +261,65 @@ async function showOverlay(page, { englishName, imageBytes, contentType, preview
   );
 }
 
+async function showIssueOverlay(page, { englishName, reason, submittedUrl, imageBytes, contentType, progress }) {
+  const imageData = imageBytes ? `data:${contentType};base64,${imageBytes.toString("base64")}` : "";
+  await page.evaluate(
+    ({ name, issue, url, src, progressText }) => {
+      document.getElementById("mcv-assist-panel")?.remove();
+      const panel = document.createElement("aside");
+      panel.id = "mcv-assist-panel";
+      panel.innerHTML = `
+        <style>
+          #mcv-assist-panel { position:fixed; inset:38px auto 12px 8px; width:40vw; z-index:2147483647;
+            background:#fff; border:4px solid #d97904; border-radius:8px; box-shadow:0 8px 30px #0005;
+            display:flex; flex-direction:column; font:14px/1.35 Arial,sans-serif; color:#18202a; }
+          #mcv-assist-panel header { padding:10px 12px; background:#fff3df; border-bottom:1px solid #e5b66f; }
+          #mcv-assist-panel .mcv-name { font-size:22px; font-weight:700; margin:3px 0; }
+          #mcv-assist-panel .mcv-issue { color:#9b3f00; font-size:17px; font-weight:700; }
+          #mcv-assist-panel .mcv-url { margin-top:6px; overflow-wrap:anywhere; font-size:12px; }
+          #mcv-assist-panel .mcv-image { flex:1; min-height:0; padding:8px; background:#222; text-align:center; overflow:auto; }
+          #mcv-assist-panel img { max-width:100%; min-width:70%; height:auto; background:white; }
+          #mcv-assist-panel .mcv-empty { flex:1; padding:30px 15px; font-size:22px; text-align:center; color:#9b3f00; }
+          #mcv-assist-panel footer { padding:8px 10px; display:flex; gap:8px; align-items:center; }
+          #mcv-assist-panel button { padding:8px 12px; cursor:pointer; }
+          #mcv-assist-panel .mcv-stop { margin-left:auto; }
+        </style>
+        <header>
+          <div>${progressText} · MANUAL REVIEW REQUIRED</div>
+          <div class="mcv-name"></div>
+          <div class="mcv-issue"></div>
+          <div class="mcv-url"></div>
+        </header>
+        ${src ? '<div class="mcv-image"><img alt="Submitted certificate"></div>' : '<div class="mcv-empty">Certificate image cannot be displayed automatically.</div>'}
+        <footer>
+          <button type="button" data-action="next">Leave ungraded and continue</button>
+          <button type="button" data-action="open">Open submitted link</button>
+          <button type="button" data-action="stop" class="mcv-stop">Stop assistant</button>
+        </footer>`;
+      panel.querySelector(".mcv-name").textContent = name || "Student name unavailable";
+      panel.querySelector(".mcv-issue").textContent = issue;
+      panel.querySelector(".mcv-url").textContent = url || "No submitted URL was detected.";
+      const image = panel.querySelector("img");
+      if (image) image.src = src;
+      const openButton = panel.querySelector('[data-action="open"]');
+      if (!url) openButton.disabled = true;
+      openButton.addEventListener("click", () => {
+        if (url) window.open(url, "_blank", "noopener");
+      });
+      panel.querySelector('[data-action="next"]').addEventListener("click", () => window.__mcvAssistEvent("skip"));
+      panel.querySelector('[data-action="stop"]').addEventListener("click", () => window.__mcvAssistEvent("stop"));
+      document.body.appendChild(panel);
+    },
+    {
+      name: englishName,
+      issue: reason,
+      url: submittedUrl,
+      src: imageData,
+      progressText: progress,
+    },
+  );
+}
+
 async function setScoreWithoutEvents(scoreInput) {
   return scoreInput.locator.evaluate((element) => {
     if (String(element.value || "").trim()) return false;
@@ -360,9 +419,33 @@ async function main() {
         await writeReport(reportPath, report);
         console.log(`[${index + 1}/${rows.length}] skipped ${row.id}: ${reason}`);
       };
+      const reviewIssue = async (reason, image = null) => {
+        const uiEventPromise = new Promise((resolve) => {
+          resolveUiEvent = resolve;
+        });
+        await showIssueOverlay(page, {
+          englishName: base.name,
+          reason,
+          submittedUrl: base.submitted_url,
+          imageBytes: image?.bytes,
+          contentType: image?.contentType,
+          progress: `${index + 1} of ${rows.length}`,
+        });
+        console.log(`[${index + 1}/${rows.length}] manual review: ${row.id}: ${reason}`);
+        const event = await uiEventPromise;
+        resolveUiEvent = null;
+        report.push({
+          ...base,
+          status: event === "stop" ? "STOPPED" : "MANUAL_REVIEW_REQUIRED",
+          reason,
+        });
+        await writeReport(reportPath, report);
+        return event;
+      };
 
       if (!row.href) {
-        await skip("No grading-page link found");
+        const event = await reviewIssue("No grading-page link found");
+        if (event === "stop") break;
         continue;
       }
       const gradingUrl = new URL(row.href, listUrl).href;
@@ -372,14 +455,23 @@ async function main() {
       base.name = detail.englishName || row.listName;
       base.submitted_url = detail.url || "";
       if (detail.reason) {
-        await skip(detail.reason);
+        const event = await reviewIssue(detail.reason);
+        if (event === "stop") break;
+        continue;
+      }
+
+      // Avoid link downloads and OCR for rows that have already been graded.
+      const earlyScoreInput = await findScoreInput(page);
+      if (earlyScoreInput && String(earlyScoreInput.value || "").trim()) {
+        await skip("Score field is already populated; refusing to overwrite it");
         continue;
       }
 
       const imagePath = path.join(tempRoot, `${row.id.replace(/[^A-Za-z0-9_-]/g, "_")}.img`);
       const image = await downloadDirectImage(context, detail.url, imagePath);
       if (image.reason) {
-        await skip(image.reason);
+        const event = await reviewIssue(image.reason);
+        if (event === "stop") break;
         continue;
       }
       let ocrText;
@@ -387,26 +479,26 @@ async function main() {
         const ocrDir = await mkdtemp(path.join(tempRoot, "ocr-"));
         ocrText = await runOcr(imagePath, ocrDir);
       } catch (error) {
-        await skip(`OCR failed: ${error.message}`);
+        const event = await reviewIssue(`OCR failed: ${error.message}`, image);
+        if (event === "stop") break;
         continue;
       }
       if (!hasExactNameMatch(ocrText, detail.englishName)) {
-        await skip("Exact English full name not found by OCR");
+        const event = await reviewIssue("Exact English full name not found by OCR", image);
+        if (event === "stop") break;
         continue;
       }
 
-      const scoreInput = await findScoreInput(page);
+      const scoreInput = earlyScoreInput ?? (await findScoreInput(page));
       const submitButton = await findSubmitButton(page);
       if (!scoreInput) {
-        await skip("Blank /1 score field not found safely");
-        continue;
-      }
-      if (String(scoreInput.value || "").trim()) {
-        await skip("Score field is already populated; refusing to overwrite it");
+        const event = await reviewIssue("Blank /1 score field not found safely", image);
+        if (event === "stop") break;
         continue;
       }
       if (!submitButton) {
-        await skip("Native Submit button not found safely");
+        const event = await reviewIssue("Native Submit button not found safely", image);
+        if (event === "stop") break;
         continue;
       }
 
