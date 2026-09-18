@@ -28,12 +28,22 @@ const REQUIRED_WIDTH = 2400;
 const REQUIRED_HEIGHT = 1600;
 
 function parseArgs(argv) {
-  const options = { url: "", moduleNumber: "", offset: 0, limit: Infinity, dryRun: false };
+  const options = {
+    url: "",
+    courseCode: "",
+    moduleNumber: "",
+    offset: 0,
+    limit: Infinity,
+    delayMs: 3000,
+    dryRun: false,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--url") options.url = argv[++i];
+    else if (argv[i] === "--course") options.courseCode = argv[++i];
     else if (argv[i] === "--module") options.moduleNumber = argv[++i];
     else if (argv[i] === "--offset") options.offset = Number(argv[++i]);
     else if (argv[i] === "--limit") options.limit = Number(argv[++i]);
+    else if (argv[i] === "--delay-ms") options.delayMs = Number(argv[++i]);
     else if (argv[i] === "--dry-run") options.dryRun = true;
     else if (argv[i] === "--help") options.help = true;
     else throw new Error(`Unknown argument: ${argv[i]}`);
@@ -46,6 +56,12 @@ function parseArgs(argv) {
   }
   if (!options.help && options.moduleNumber && !/^[1-9]\d*$/.test(options.moduleNumber)) {
     throw new Error("--module must be a positive integer");
+  }
+  if (!options.help && options.courseCode && !/^\d{7}$/.test(options.courseCode)) {
+    throw new Error("--course must be exactly seven digits");
+  }
+  if (!options.help && (!Number.isInteger(options.delayMs) || options.delayMs < 1000 || options.delayMs > 30_000)) {
+    throw new Error("--delay-ms must be an integer between 1000 and 30000");
   }
   return options;
 }
@@ -142,7 +158,7 @@ async function downloadStrictCertificate(context, url, destination) {
   };
 }
 
-async function detectAssignment(page, requestedModuleNumber) {
+async function detectAssignment(page, requestedModuleNumber, requestedCourseCode) {
   const bodyText = await page.locator("body").innerText();
   const moduleMatches = [...bodyText.matchAll(/(?:certificate\s+)?module\s*(\d+)/gi)].map((match) => match[1]);
   const moduleNumbers = [...new Set(moduleMatches)];
@@ -155,10 +171,24 @@ async function detectAssignment(page, requestedModuleNumber) {
     throw new Error(`Could not identify exactly one module number (found: ${moduleNumbers.join(", ") || "none"})`);
   }
 
-  const selectedOptions = await page.locator("select option:checked").allInnerTexts();
+  const courseHomeMatch = bodyText.match(/(?:^|\n)\s*(\d{7})\s*\(\d{4}\/\d+\)\s*\|\s*Home\b/i);
+  const selectedOptions = await page.locator("select:visible option:checked").allInnerTexts();
   const preferredCourseCodes = selectedOptions.flatMap((text) => text.match(/\b\d{7}\b/g) ?? []);
   const bodyCourseCodes = bodyText.match(/\b\d{7}\b/g) ?? [];
-  const courseCodes = [...new Set(preferredCourseCodes.length ? preferredCourseCodes : bodyCourseCodes)];
+  if (requestedCourseCode && !bodyCourseCodes.includes(requestedCourseCode)) {
+    throw new Error(`Selected page does not mention requested course ${requestedCourseCode}`);
+  }
+  const courseCodes = [
+    ...new Set(
+      requestedCourseCode
+        ? [requestedCourseCode]
+        : courseHomeMatch
+        ? [courseHomeMatch[1]]
+        : preferredCourseCodes.length
+          ? preferredCourseCodes
+          : bodyCourseCodes,
+    ),
+  ];
   if (courseCodes.length !== 1) {
     throw new Error(`Could not identify exactly one 7-digit course code (found: ${courseCodes.join(", ") || "none"})`);
   }
@@ -227,10 +257,87 @@ async function writeReport(reportPath, rows, assignment) {
   await writeFile(reportPath, `${csv}\n`, "utf8");
 }
 
+async function showCertificateOverlay(page, { candidate, imageBytes, assignment, status }) {
+  const imageData = `data:image/jpeg;base64,${imageBytes.toString("base64")}`;
+  await page.evaluate(
+    ({ item, src, courseCode, moduleNumber, statusText }) => {
+      document.getElementById("mcv-auto-panel")?.remove();
+      const panel = document.createElement("aside");
+      panel.id = "mcv-auto-panel";
+      panel.innerHTML = `
+        <style>
+          #mcv-auto-panel { position:fixed; inset:38px auto 12px 8px; width:40vw; z-index:2147483647;
+            background:#fff; border:4px solid #7a3cff; border-radius:8px; box-shadow:0 8px 30px #0007;
+            display:flex; flex-direction:column; font:14px/1.35 Arial,sans-serif; color:#18202a; }
+          #mcv-auto-panel header { padding:10px 12px; background:#f3edff; border-bottom:1px solid #cbb6ff; }
+          #mcv-auto-panel .mcv-auto-name { font-size:22px; font-weight:700; margin:3px 0; }
+          #mcv-auto-panel .mcv-auto-meta { font-weight:700; }
+          #mcv-auto-panel .mcv-auto-status { margin-top:5px; color:#6b25d8; font-size:16px; font-weight:700; }
+          #mcv-auto-panel .mcv-auto-image { flex:1; min-height:0; padding:8px; background:#222; text-align:center; overflow:auto; }
+          #mcv-auto-panel img { max-width:100%; min-width:70%; height:auto; background:white; }
+          #mcv-auto-panel footer { padding:9px 10px; display:flex; gap:8px; align-items:center; }
+          #mcv-auto-panel button { padding:9px 16px; cursor:pointer; font-weight:700; }
+          #mcv-auto-panel .mcv-auto-stop { margin-left:auto; color:white; background:#b00020; border:0; border-radius:5px; }
+        </style>
+        <header>
+          <div>STRICT AUTOMATIC CERTIFICATE CHECK</div>
+          <div class="mcv-auto-name"></div>
+          <div class="mcv-auto-meta"></div>
+          <div class="mcv-auto-status"></div>
+        </header>
+        <div class="mcv-auto-image"><img alt="Submitted certificate"></div>
+        <footer>
+          <span>Press Esc or Stop to halt before the next submission.</span>
+          <button type="button" class="mcv-auto-stop">STOP IMMEDIATELY</button>
+        </footer>`;
+      panel.querySelector(".mcv-auto-name").textContent = `${item.name} (${item.student_id})`;
+      panel.querySelector(".mcv-auto-meta").textContent = `Course ${courseCode} · Module ${moduleNumber}`;
+      panel.querySelector(".mcv-auto-status").textContent = statusText;
+      panel.querySelector("img").src = src;
+      panel.querySelector(".mcv-auto-stop").addEventListener("click", () => window.__mcvAutoStop());
+      document.addEventListener(
+        "keydown",
+        (event) => {
+          if (event.key === "Escape") window.__mcvAutoStop();
+        },
+        { capture: true },
+      );
+      document.body.appendChild(panel);
+    },
+    {
+      item: { name: candidate.name, student_id: candidate.student_id },
+      src: imageData,
+      courseCode: assignment.courseCode,
+      moduleNumber: assignment.moduleNumber,
+      statusText: status,
+    },
+  );
+}
+
+async function updateOverlayStatus(page, status) {
+  await page
+    .evaluate((statusText) => {
+      const element = document.querySelector("#mcv-auto-panel .mcv-auto-status");
+      if (element) element.textContent = statusText;
+    }, status)
+    .catch(() => {});
+}
+
+async function safetyCountdown(page, delayMs, isStopped) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < delayMs) {
+    if (isStopped()) return false;
+    const remainingMs = delayMs - (Date.now() - startedAt);
+    await updateOverlayStatus(page, `All checks passed · automatic 1/1 in ${Math.max(1, Math.ceil(remainingMs / 1000))}s`);
+    await page.waitForTimeout(Math.min(250, Math.max(1, remainingMs)));
+  }
+  return !isStopped();
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
-    console.log("Usage: npm run auto-grade -- [--url SUBMISSIONS_URL] [--module N] [--offset N] [--limit N] [--dry-run]");
+    console.log("Usage: npm run auto-grade -- [--url SUBMISSIONS_URL] [--course CODE] [--module N] [--offset N] [--limit N] [--delay-ms N] [--dry-run]");
     return;
   }
 
@@ -245,11 +352,16 @@ async function main() {
   const context = await chromium.launchPersistentContext(PROFILE_DIR, { headless: false, viewport: null });
   const page = context.pages()[0] ?? (await context.newPage());
   const results = [];
+  let stopRequested = false;
+  await page.exposeBinding("__mcvAutoStop", () => {
+    stopRequested = true;
+    console.error("Emergency stop requested. No further submissions will be started.");
+  });
   try {
     await page.goto(options.url || HOME_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await promptForPage(page);
     const listUrl = page.url();
-    const assignment = await detectAssignment(page, options.moduleNumber);
+    const assignment = await detectAssignment(page, options.moduleNumber, options.courseCode);
     const allRows = await collectRows(page);
     const end = options.limit === Infinity ? undefined : options.offset + options.limit;
     const rows = allRows.slice(options.offset, end);
@@ -334,6 +446,22 @@ async function main() {
         continue;
       }
 
+      await showCertificateOverlay(page, {
+        candidate: { ...result, name: detail.englishName },
+        imageBytes: image.bytes,
+        assignment,
+        status: "Strict checks passed · read-only scan phase",
+      });
+      await page.waitForTimeout(350);
+      if (stopRequested) {
+        result.status = "STOPPED";
+        result.reason = "Stopped by user during read-only scan; grade unchanged";
+        results.push(result);
+        await writeReport(reportPath, results, assignment);
+        console.log("Stopped during read-only scan. No grades were changed by this run.");
+        return;
+      }
+
       result.status = "CANDIDATE";
       result.reason = "Passed all strict certificate checks; grade not yet changed";
       results.push(result);
@@ -371,6 +499,10 @@ async function main() {
 
     for (let index = 0; index < eligible.length; index += 1) {
       const candidate = eligible[index];
+      if (stopRequested) {
+        console.log("Stopped before starting the next submission.");
+        break;
+      }
       await page.goto(candidate.grading_url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       const detail = await extractDetail(page, candidate.name);
       if (detail.reason || detail.url !== candidate.submitted_url) {
@@ -388,6 +520,23 @@ async function main() {
         continue;
       }
 
+      const evidencePath = path.join(runDir, candidate.evidence_image);
+      const evidenceBytes = await readFile(evidencePath);
+      await showCertificateOverlay(page, {
+        candidate,
+        imageBytes: evidenceBytes,
+        assignment,
+        status: "Preparing safety countdown",
+      });
+      const continueSubmission = await safetyCountdown(page, options.delayMs, () => stopRequested);
+      if (!continueSubmission) {
+        candidate.status = "STOPPED_BEFORE_SUBMIT";
+        candidate.reason = "Emergency stop requested before score entry; grade unchanged";
+        await writeReport(reportPath, results, assignment);
+        console.log(`Stopped safely before submitting ${candidate.student_id}.`);
+        break;
+      }
+
       const previousBody = await page.locator("body").innerText();
       const previousUpdatedText = previousBody.match(/Grading updated at[^\n]*/i)?.[0] ?? "";
       const saveResponsePromise = watchForSaveResponse(page, scoreInput.name);
@@ -403,9 +552,21 @@ async function main() {
         continue;
       }
 
+      if (stopRequested) {
+        await scoreInput.locator.evaluate((element) => {
+          element.value = "";
+        });
+        candidate.status = "STOPPED_BEFORE_SUBMIT";
+        candidate.reason = "Emergency stop requested after prefill; score cleared and not submitted";
+        await writeReport(reportPath, results, assignment);
+        console.log(`Stopped safely before clicking Submit for ${candidate.student_id}.`);
+        break;
+      }
+
       // This is the only programmatic state-changing action in auto mode.
       // The selected element is the site's native Submit control; no other
       // grading, comment, lock, or announcement control is touched.
+      await updateOverlayStatus(page, "Submitting 1/1 now…");
       await submitButton.click();
       const save = await waitForSave(page, saveResponsePromise, previousUpdatedText);
       if (!save.ok) {
@@ -417,6 +578,7 @@ async function main() {
       candidate.status = "AUTO_SUBMITTED_1";
       candidate.reason = save.reason;
       await writeReport(reportPath, results, assignment);
+      await updateOverlayStatus(page, "Confirmed saved: 1/1");
       console.log(`[${index + 1}/${eligible.length}] confirmed 1/1 for ${candidate.student_id}`);
       await page.waitForTimeout(400);
     }

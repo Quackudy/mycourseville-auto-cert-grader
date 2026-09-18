@@ -92,7 +92,7 @@ You may explicitly enter the expected module number. The selected assignment
 page must mention the same module or the run stops:
 
 ```bash
-npm run auto-grade -- --module 4 --dry-run
+npm run auto-grade -- --course 2110204 --module 4 --dry-run
 ```
 
 To inspect a later segment during testing, use for example:
@@ -112,6 +112,11 @@ one-time `SUBMIT N` authorization for that batch. It then submits `1/1` only for
 those candidates and verifies MyCourseVille's visible save confirmation after
 every submission. Any unconfirmed save stops the entire run. Evidence and an
 audit CSV are retained under `auto-grade-reports/`.
+
+Auto mode displays every passing certificate beside the grading form. Before
+each submission it shows a three-second countdown. Click **STOP IMMEDIATELY** or
+press Escape to halt before the next Submit action. The delay can be increased,
+for example with `--delay-ms 5000`.
 
 ## Safety properties
 
