@@ -1,0 +1,15 @@
+{
+  "name": "mycourseville-certificate-reader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only MyCourseVille certificate submission scanner",
+  "scripts": {
+    "scan": "node scan.mjs",
+    "assist": "node assist.mjs",
+    "auto-grade": "node auto-grade.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}
